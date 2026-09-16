@@ -373,17 +373,12 @@ def _subtileStackForTLU1(state, tc, mtTiles):
 # emit.  (AB_B16_TLU1 and AB_B16_TLU1_16x1 remain registered but unreachable --
 # as they were before the 4x1 geometry existed, when Solution.py hardcoded the
 # former and no bf16 TLU=1 kernel emitted at all.)
+#
+# Being a constant rather than a chooser is why the bf16 call site does not look
+# like the fp4 one: there is nothing to fall back to, so it checks
+# _subtileTLU1StackReason on this height and rejects the solution outright when
+# the geometry refuses it.
 _SUBTILE_STACK_B16 = 4
-
-
-def _subtileStackForTLU1B16(state, tc, mtTiles):
-  """Stack height for a TLU=1 bf16/fp16 operand.  See _SUBTILE_STACK_B16.
-
-  Unlike the fp4 chooser this cannot fall back: the caller checks
-  _subtileTLU1StackReason on what comes back and rejects the solution when the
-  geometry refuses it.
-  """
-  return _SUBTILE_STACK_B16
 
 
 def _validateSubtileGRKPartition(state, printRejectionReason):
@@ -1308,7 +1303,7 @@ class Solution(collections.abc.Mapping):
           if dtype.isBFloat16() or dtype.isHalf():
             mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
             mtTiles = mtFree // state["MatrixInstM"]
-            stack = _subtileStackForTLU1B16(state, tc, mtTiles)
+            stack = _SUBTILE_STACK_B16
             stackReason = _subtileTLU1StackReason(state, tc, mtTiles, stack)
             if stackReason:
               reject(state, printRejectionReason, stackReason)
