@@ -365,8 +365,8 @@ def _subtileStackForTLU1(state, tc, mtTiles):
 # better here: a stack of 8 or 16 spans 256/512 B and buys no extra line
 # coverage while doubling or quadrupling the LDS footprint and the padding.
 #
-# So bf16 has exactly one stack, and there is no ladder to walk.  This is also
-# what the LDS swizzle supports: swizzleBitsForSubtile(4) is 2 bits, and
+# So 4 is the ceiling as well as the preference.  That is also what the LDS
+# swizzle supports: swizzleBitsForSubtile(4) is 2 bits, and
 # SubtileGeometry._SWZ_K_BITS_MSB_FIRST defines exactly the two k bits those
 # consume.  A stack of 8 would need a third, which is not derived anywhere, so
 # admitting 8 or 16 here would trade a clean rejection for an assertion during
@@ -374,11 +374,29 @@ def _subtileStackForTLU1(state, tc, mtTiles):
 # as they were before the 4x1 geometry existed, when Solution.py hardcoded the
 # former and no bf16 TLU=1 kernel emitted at all.)
 #
-# Being a constant rather than a chooser is why the bf16 call site does not look
-# like the fp4 one: there is nothing to fall back to, so it checks
-# _subtileTLU1StackReason on this height and rejects the solution outright when
-# the geometry refuses it.
-_SUBTILE_STACK_B16 = 4
+# Shorter, though, is reachable.  A 2-tile strip spans 64 B -- half a line, so it
+# is never preferred -- but it lays out M-tile counts a 4-stack refuses: 6, 10,
+# 14, ... tiles hit the partial-tail rule at 4 and are whole strips at 2, and an
+# odd number of strips per wave straddles at 4 and does not at 2.  Both swizzle
+# halves already handle the 1-bit width it implies: _SWZ_K_BITS_MSB_FIRST is
+# sliced [:swizzleBits], and _emitTLU1LRSwizzle documents the 32-row M-extent
+# case alongside the 64-row one.  So bf16 walks a two-rung ladder, 4 then 2,
+# the same shape as the fp4 chooser above.
+_SUBTILE_STACK_SIZES_B16 = (4, 2)
+
+
+def _subtileStackForB16TLU1(state, tc, mtTiles):
+  """Stack height for a TLU=1 bf16/fp16 operand, or None when neither fits.
+
+  Unlike _subtileStackForTLU1 this returns None rather than the preferred height
+  on total failure: there is no geometry to fall back to, so the caller rejects
+  and the rejection reason should be the one from the *preferred* height, which
+  is what the caller re-derives.
+  """
+  for stack in _SUBTILE_STACK_SIZES_B16:
+    if _subtileTLU1StackReason(state, tc, mtTiles, stack) is None:
+      return stack
+  return None
 
 
 def _validateSubtileGRKPartition(state, printRejectionReason):
@@ -1303,12 +1321,18 @@ class Solution(collections.abc.Mapping):
           if dtype.isBFloat16() or dtype.isHalf():
             mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
             mtTiles = mtFree // state["MatrixInstM"]
-            stack = _SUBTILE_STACK_B16
-            stackReason = _subtileTLU1StackReason(state, tc, mtTiles, stack)
-            if stackReason:
-              reject(state, printRejectionReason, stackReason)
+            stack = _subtileStackForB16TLU1(state, tc, mtTiles)
+            if stack is None:
+              # Report the preferred height's reason: it is the one that
+              # describes the shape the caller asked for.
+              reject(state, printRejectionReason,
+                     _subtileTLU1StackReason(state, tc, mtTiles,
+                                             _SUBTILE_STACK_SIZES_B16[0]))
               return
-            state[f"_ABTilePair{tc}"] = {4: "AB_B16_TLU1_4x1"}[stack]
+            state[f"_ABTilePair{tc}"] = {
+              2: "AB_B16_TLU1_2x1",
+              4: "AB_B16_TLU1_4x1",
+            }[stack]
           elif dtype.isFloat4():
             # Two fp4 share a byte, so an odd free-dim extent leaves the K
             # stride on a half byte and the elements-to-bytes shift truncates
@@ -2290,20 +2314,13 @@ class Solution(collections.abc.Mapping):
       if not state["MIWaveTile"] or len(state["MIWaveTile"]) != 2:
         reject(state, printRejectionReason, "invalid MIWaveTile")
         return
-      # LraTileAssignment computes wave/block offsets with vectorStaticRemainder
-      # using num1DWaves (=MIWaveGroup[0|1]) or num1DBlocks (=MatrixInstBM|BN)
-      # as the divisor, and reuses one vgpr for dividend / quotient / remainder.
-      # That aliasing is safe only on the power-of-2 fast path (single
-      # v_and_b32); the magic-number path would overwrite the dividend with the
-      # quotient before computing the remainder.
-      for _name, _val in (("MIWaveGroup[0]", state["MIWaveGroup"][0]),
-                          ("MIWaveGroup[1]", state["MIWaveGroup"][1]),
-                          ("MatrixInstBM",   state["MatrixInstBM"]),
-                          ("MatrixInstBN",   state["MatrixInstBN"])):
-        if _val > 1 and (_val & (_val - 1)) != 0:
-          reject(state, printRejectionReason,
-                 f"{_name}={_val} must be a power of two (LraTileAssignment vectorStaticRemainder fast path)")
-          return
+      # MIWaveGroup[0|1] / MatrixInstBM|BN reach LraTileAssignment as the divisor
+      # of an in-place vectorStaticRemainder.  Those call sites used to alias
+      # quotient/remainder/dividend onto one vgpr, which is only correct on the
+      # power-of-2 fast path, so non-power-of-2 values were rejected here.
+      # staticRemainderInPlace (LraTileAssignment.py) now hands the magic-number
+      # path a distinct quotient register, so the restriction is lifted.  This
+      # is what makes MT320 (320/16 = 20 = 4*5) reachable via MIWaveGroup 5.
       if state["UseSubtileImpl"] and (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]):
         if state["MIWaveTile"][0] % 2 != 0 or state["MIWaveTile"][1] % 2 != 0:
           reject(state, printRejectionReason,

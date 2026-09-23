@@ -1,0 +1,17 @@
+# serializer version: 1
+# name: test_r5_subtile_kern_tlu1_gfx950_golden
+  list([
+    dict({
+      'basename': 'Cijk_Ailk_Bljk_BBS_BH_UserArgs_MT128x128x64_MI16LOENuDYETVpSCfPtkJHfBdLmdF7DWAD25KuZ57NaRMg=',
+      'err': 0,
+    }),
+    dict({
+      'basename': 'Cijk_Ailk_Bljk_BBS_BH_UserArgs_MT128x64x64_MI16xR1QnFiWy7D1ZN4B42IKTgWqAmwAxkr2m0O_4sjfLZyo=',
+      'err': 0,
+    }),
+    dict({
+      'basename': 'Cijk_Ailk_Bljk_BBS_BH_UserArgs_MT64x64x64_MI16x1H2nMp9RbIXcpudGfrG4t1m0L9fVHc09dXlZYkwg-NlQ=',
+      'err': 0,
+    }),
+  ])
+# ---
