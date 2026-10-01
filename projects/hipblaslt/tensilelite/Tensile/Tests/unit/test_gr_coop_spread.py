@@ -145,9 +145,13 @@ def test_per_wave_share_divides_the_strip():
 
 
 # Every distinct input the generator produces, measured by instrumenting kernel
-# generation over the gfx950 TLU=1 yaml (subtile_mxfp4_tlu1, the only one that
-# reaches this code): 316 calls, 20 combinations, unit always 1024 bytes. The
-# TLU=0 suites never call it.
+# generation over the gfx950 TLU=1 groups in subtile_mxfp4.yaml: 316 calls, 20
+# combinations, unit always 1024 bytes.  The TLU=0 groups never call it.
+#
+# subtile_mxfp4_tlu1.yaml also reaches this code and is NOT included in that
+# measurement -- it was a separate file here while subtile_mxfp4.yaml was being
+# consolidated upstream, and the two arrived together in the merge.  Re-measure
+# across both before treating the range below as exhaustive.
 #
 # This is here so a shape landing outside the range is noticed as new rather than
 # assumed covered. It is not a supported-values list: the function handles more

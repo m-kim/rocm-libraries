@@ -341,24 +341,27 @@ AB_B16_TLU1_16x1 = ABTilePair(
 )
 
 # Column-major FP4 (TLU=1, NT): the MFMA-K layout is recovered on the LDS read
-# via ds_read_b64_tr_b4.  Taller stacks below pack more MFMA-M tiles per
-# contiguous strip at the same b128 load width.
-AB_B4_TLU1 = ABTilePair(
-    gr=ABGRGeometry(tag=GRTag_TLU1(), **_B4, tlu=True, subtileShape=(2, 1), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=32, k=1)),  # 2 MFMA-M tiles = 32 fp4 = 16 B contiguous along M, 1 b128 GR load
-    lr=ABLRGeometry(tag=LRTag_TLU1(), **_B4, tlu=True, subtileShape=(2, 1), loadShape=LoadShape(m=32, k=1)),                                   # 128-bit LR: 32 fp4 along M
-)
-AB_B4_TLU1_4x1 = ABTilePair(
-    gr=ABGRGeometry(tag=GRTag_TLU1(), **_B4, tlu=True, subtileShape=(4, 1), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=32, k=1)),  # 4 MFMA-M tiles = 64 fp4 = 32 B contiguous along M, 2 b128 GR loads
-    lr=ABLRGeometry(tag=LRTag_TLU1(), **_B4, tlu=True, subtileShape=(4, 1), loadShape=LoadShape(m=32, k=1)),
-)
-AB_B4_TLU1_8x1 = ABTilePair(
-    gr=ABGRGeometry(tag=GRTag_TLU1(), **_B4, tlu=True, subtileShape=(8, 1), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=32, k=1)),  # 8 MFMA-M tiles = 128 fp4 = 64 B contiguous along M, 4 b128 GR loads
-    lr=ABLRGeometry(tag=LRTag_TLU1(), **_B4, tlu=True, subtileShape=(8, 1), loadShape=LoadShape(m=32, k=1)),
-)
-AB_B4_TLU1_16x1 = ABTilePair(
-    gr=ABGRGeometry(tag=GRTag_TLU1(), **_B4, tlu=True, subtileShape=(16, 1), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=32, k=1)),  # 16 MFMA-M tiles = 256 fp4 = 128 B contiguous along M, 8 b128 GR loads
-    lr=ABLRGeometry(tag=LRTag_TLU1(), **_B4, tlu=True, subtileShape=(16, 1), loadShape=LoadShape(m=32, k=1)),
-)
+# via ds_read_b64_tr_b4.  A stack of N packs N MFMA-M tiles into one contiguous
+# strip (N * 16 fp4 = N * 8 bytes) at the same b128 load width, so N also fixes
+# the GR load count per strip.  Everything else is identical across stacks, so
+# the geometries are built rather than written out.
+AB_B4_TLU1_STACKS = (2, 4, 8, 16)
+_AB_B4_TLU1_UNSUFFIXED_STACK = 2
+
+
+def abB4Tlu1Name(stack: int) -> str:
+  """AB_GEOMETRY_MAP key for the fp4 TLU=1 geometry with this stack height."""
+  if stack == _AB_B4_TLU1_UNSUFFIXED_STACK:
+    return "AB_B4_TLU1"
+  return "AB_B4_TLU1_%ux1" % stack
+
+
+def _abB4Tlu1(stack: int) -> ABTilePair:
+  shape = (stack, 1)
+  return ABTilePair(
+      gr=ABGRGeometry(tag=GRTag_TLU1(), **_B4, tlu=True, subtileShape=shape, subtileCount=1, subtileStride=0, loadShape=LoadShape(m=32, k=1)),
+      lr=ABLRGeometry(tag=LRTag_TLU1(), **_B4, tlu=True, subtileShape=shape, loadShape=LoadShape(m=32, k=1)),
+  )
 
 
 # MX scale factor inputs (one scale per mxBlock data elements)
@@ -399,10 +402,7 @@ AB_GEOMETRY_MAP = {
   "AB_B16_TLU1": AB_B16_TLU1,
   "AB_B16_TLU1_16x1": AB_B16_TLU1_16x1,
   "AB_B16_W32":  AB_B16_W32,
-  "AB_B4_TLU1":  AB_B4_TLU1,
-  "AB_B4_TLU1_4x1": AB_B4_TLU1_4x1,
-  "AB_B4_TLU1_8x1": AB_B4_TLU1_8x1,
-  "AB_B4_TLU1_16x1": AB_B4_TLU1_16x1,
+  **{abB4Tlu1Name(stack): _abB4Tlu1(stack) for stack in AB_B4_TLU1_STACKS},
 }
 
 def selectABGeometry(kernel: dict, tc: str) -> ABTilePair:
@@ -422,6 +422,28 @@ def selectDGeometry(kernel: dict) -> CDTileGeometry:
 # TileInfo — runtime tile state
 ################################################################################
 
+def _wholeStripsAlongFreeDim(gr_cfg, macroTile, depthU):
+  """Subtile grid whose free-dim strip count is rounded up to whole strips.
+
+  A macro tile that is not a multiple of the stack (96 free-dim elements over an
+  8-tile stack) still occupies a whole strip.  LDS sizing, the GR m0 walk and the
+  LR K-window stride all key off this, so the round-up happens once, here.
+  """
+  grid = list(gr_cfg.globalSubtileGrid(macroTile, depthU))
+  grid[0] = math.ceil(grid[0])
+  return grid
+
+
+def _wavesSharingOneStrip(stackM, perWaveMTiles):
+  """Waves that split one GR strip's K rows between them.
+
+  Normally 1, since a strip is one wave's M extent.  A tall stack makes the
+  strip span several waves' extents, leaving fewer tiles per wave than the stack
+  itself, where the plain ratio would floor to 0.
+  """
+  return max(1, stackM // perWaveMTiles) if perWaveMTiles else 1
+
+
 class TileInfo:
   """Runtime tile state combining frozen geometry with kernel/writer config.
 
@@ -436,6 +458,18 @@ class TileInfo:
     writer:   KernelWriter with register pools (vgprPool, sgprPool, agprPool).
     kernel:   Kernel configuration dictionary.
   """
+
+  # GR cooperative-spread defaults for the tiles that take no part in it (D and
+  # the MX scales).  Real attributes rather than getattr fallbacks at the call
+  # sites, so a rename raises instead of silently selecting another swizzle.
+  grWavesPerStrip  = 1
+  grCoopWaves      = 1
+  grKSplit         = 1
+  grKWindowSplit   = 1
+  grWindowsPerWave = 1
+  grOtherAxisWaves = 1
+  # Row padding is a TDM (gfx1250) concern, so non-AB tiles carry none.
+  ldsRowPadBytes   = 0
 
   def __init__(self, geometry: TileGeometry, tc: str, writer, kernel):
     self.geometry = geometry
@@ -467,6 +501,10 @@ class TileInfo:
 
     self.waveSize = kernel["WavefrontSize"]
     self.numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
+    # Waves whose loads tile one strip between them.  Every wave, until the A/B
+    # branch below narrows it to the cooperative fetch group.  Depends on
+    # numWaves, so it cannot be a class default like the rest.
+    self.grLoadWaves = self.numWaves
 
     # --- Compute instantiated grids (geometry + kernel config) ---
     # Subtile grid is global (waves cooperate on subtiles).
@@ -487,33 +525,16 @@ class TileInfo:
       self.subtileShape        = list(gr_cfg.subtileShape)
       self.subtileCount        = gr_cfg.subtileCount
       self.subtileStride       = gr_cfg.subtileStride
-      # Strip count along the free dim.  Rounded UP: a macro tile that is not a
-      # multiple of the stack (96 free-dim elements over an 8-tile stack) is
-      # covered by a whole strip whose surplus M tiles are fetched into LDS and
-      # never read back.  Exact for every power-of-two tile, so this is a no-op
-      # there.  Every consumer -- LDS sizing, the GR m0 walk, the LR K-window
-      # stride -- keys off this, so the round-up has to happen once, here.
-      self.globalSubtileGrid = list(gr_cfg.globalSubtileGrid(self.macroTile, self.depthU))
-      self.globalSubtileGrid[0] = math.ceil(self.globalSubtileGrid[0])
-      # Waves per GR strip along the free dim.  Normally 1: the GR strip is one
-      # wave's M extent, so each wave owns whole strips.  With a tall stack the
-      # GR strip spans several waves' extents, so localMMATileGrid[0] (per wave)
-      # is smaller than subtileShape[0] and the plain ratio would floor to 0.
-      # Those waves cooperate on one strip instead, splitting its K rows.
       grStackM      = int(self.subtileShape[0])
       perWaveMTiles = int(self.localMMATileGrid[0])
-      self.grWavesPerStrip = max(1, grStackM // perWaveMTiles) if perWaveMTiles else 1
+      self.globalSubtileGrid = _wholeStripsAlongFreeDim(gr_cfg, self.macroTile, self.depthU)
+      self.grWavesPerStrip   = _wavesSharingOneStrip(grStackM, perWaveMTiles)
       self.localSubtileGrid  = [max(1, int(perWaveMTiles / grStackM)),
                                  int(self.localMMATileGrid[1] / self.subtileShape[1])]
       self.subtileSize       = gr_cfg.subtileSizeBytes()
 
-      # Cooperative GR load counts (scheduler: vmcnt, loop trip count).
-      # loadRatioGR uses the global GR tile size (subtileShape * subtileCount),
-      # which is the full hardware granularity for one cooperative load round.
-      # Waves that COOPERATE ON THE FETCH -- distinct from grWavesPerStrip, which
-      # counts waves sharing a strip on read-back and picks the swizzle.  See
-      # planGRCoopSpread for how the group is chosen; TLU=0 fetches with every
-      # wave and does not slice.
+      # The fetch group, which is not grWavesPerStrip: that counts waves sharing
+      # a strip on read-back.  TLU=0 fetches with every wave and does not slice.
       isTLU1 = isinstance(getattr(gr_cfg, "tag", None), GRTag_TLU1)
       otherWaves = max(1, self.numWaves // self.waveGroupSize)
       numWin = int(self.localSubtileGrid[1])
@@ -1453,8 +1474,8 @@ def mainLoop(writer, kernel):
   # A K-window split spreads grKWindowSplit consecutive K windows over the
   # fetch group, so one GR round covers that many windows' worth of subIterK
   # even though a wave issues only its own.
-  grMNA, grKA = tiA.subtileShape[0], tiA.subtileShape[1] * int(getattr(tiA, "grKWindowSplit", 1))
-  grMNB, grKB = tiB.subtileShape[0], tiB.subtileShape[1] * int(getattr(tiB, "grKWindowSplit", 1))
+  grMNA, grKA = tiA.subtileShape[0], tiA.subtileShape[1] * int(tiA.grKWindowSplit)
+  grMNB, grKB = tiB.subtileShape[0], tiB.subtileShape[1] * int(tiB.grKWindowSplit)
   # TDM: one tensor_load_to_lds covers the full localMMATileGrid.
   if kernel.get("enableTDMA", False):
     grAGran = ReadGranularity(mn=tiA.localMMATileGrid[0], k=tiA.localMMATileGrid[1])

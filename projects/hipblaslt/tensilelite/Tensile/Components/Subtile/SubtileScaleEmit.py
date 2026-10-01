@@ -277,17 +277,21 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
 
   stmp = writer.sgprPool.checkOut(1, tag="_graTileAssignmentScaleSwizzledCommon_stmp")
 
-  # numThreadsPerGroup follows the scale K-subtile count, which is not always a
-  # power of two, so the split has to be a real divide rather than a shift and a
-  # mask.  The helper picks the shift itself when it can.
-  divTmp = writer.vgprPool.checkOut(2, tag="_graTileAssignmentScaleSwizzledCommon_div")
-  module.add(vectorStaticDivideAndRemainder(
-      vtmp, ti_.sharedVgprGROffset[0], "Serial", numThreadsPerGroup,
-      ContinuousRegister(divTmp, 2),
-      comment="%s: groupId = serial / %u, threadId = serial %% %u"
-              % (tc, numThreadsPerGroup, numThreadsPerGroup)))
-  writer.vgprPool.checkIn(divTmp)
-  module.add(SLShiftLeftB32(sgpr(stmp), int(math.log2(ti_.bpe)), sgpr("Strides%s"%tc), comment="*= bpe (%d)"%(ti_.bpe)))
+  # numThreadsPerGroup is the scale K-subtile count times constants that are all
+  # powers of two, and MX rejects a non-power-of-two DepthU, so the split is a
+  # shift and a mask.  (The runtime divide that used to stand here was for the
+  # TLU=1 case where a non-power-of-two DepthU carries through to the count;
+  # that is now a codegen-time rejection -- see Solution.py, "UseSubtileImpl=1
+  # MX TLU=1 requires a power-of-two DepthU".)
+  splitComment = ("%s: groupId = serial / %u, threadId = serial %% %u"
+                  % (tc, numThreadsPerGroup, numThreadsPerGroup))
+  module.add(VLShiftRightB32(dst=vgpr(vtmp),
+             shiftHex=hex(numThreadsPerGroup.bit_length() - 1), src=vgpr("Serial"),
+             comment=splitComment))
+  module.add(VAndB32(dst=vgpr(ti_.sharedVgprGROffset[0]),
+             src0=hex(numThreadsPerGroup - 1), src1=vgpr("Serial"),
+             comment=splitComment))
+  module.add(SLShiftLeftB32(sgpr(stmp), int(math.log2(ti_.bpe)), sgpr("ScaleGroupSpan%s"%tc), comment="*= bpe (%d)"%(ti_.bpe)))
 
   module.add(VMulLOU32(dst=vgpr(vtmp), src1=vgpr(vtmp), src0=sgpr(stmp), comment="Apply scale%s stride to each group"%tc))
   module.add(VLShiftLeftB32(dst=vgpr(ti_.sharedVgprGROffset[0]),
