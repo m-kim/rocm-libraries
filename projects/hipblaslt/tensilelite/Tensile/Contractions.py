@@ -635,6 +635,14 @@ class ProblemPredicate(Properties.Predicate):
             rv += [cls('SizeLessThan', index=kIdx,
                        value=kTiles * state['DepthU'] + 1)]
 
+        if state.get('UseSubtileImpl', False):
+            # Subtile kernels fault with an illegal memory access at K <= 16
+            # (seen on gfx950 bf16 NN with StreamK, e.g. MT128x16x64 at
+            # M=16384 N=16 K=16; K=17 and up run clean). Keep them off those
+            # sizes until the codegen handles it. SizeGreaterThan is strict.
+            kIdx = state['ProblemType']['NumIndicesC']
+            rv += [cls('SizeGreaterThan', index=kIdx, value=16)]
+
         return rv
 
     @classmethod
